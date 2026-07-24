@@ -74,6 +74,14 @@ dev = [
 acquire = "acquire.acquire:main"
 acquire-decrypt = "acquire.tools.decrypter:main"
 
+[tool.pytest.ini_options]
+markers = [
+    "regression: builds real filesystem images with the mkfs family and reads a snapshot of them back",
+]
+# Regression tests need tooling a CI runner does not have, and take a disk and a minute to run. They are
+# left out of a plain pytest run and of tox's default envlist, run them with "tox -e regression".
+addopts = "-m 'not regression'"
+
 [tool.ruff]
 line-length = 120
 required-version = ">=0.13.1"

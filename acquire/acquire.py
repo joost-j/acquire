@@ -19,7 +19,7 @@ import warnings
 from collections import defaultdict
 from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, BinaryIO, ClassVar, NamedTuple, NoReturn
 
 from dissect.target import Target
 from dissect.target.filesystems import ntfs
@@ -34,6 +34,7 @@ from dissect.target.plugins.os.windows.log import evt, evtx
 from dissect.target.tools.utils.cli import args_to_uri
 from dissect.util.stream import RunlistStream
 
+from acquire import fsmeta
 from acquire.collector import Collector, get_full_formatted_report, get_report_summary
 from acquire.dynamic.windows.named_objects import NamedObjectType
 from acquire.esxi import esxi_memory_context_manager
@@ -47,7 +48,7 @@ from acquire.hashes import (
     serialize_into_csv,
 )
 from acquire.log import get_file_handler, reconfigure_log_file, setup_logging
-from acquire.outputs import OUTPUTS
+from acquire.outputs import OUTPUTS, AsdfOutput
 from acquire.uploaders.minio import MinIO
 from acquire.uploaders.plugin import upload_files_using_uploader
 from acquire.uploaders.plugin_registry import UploaderRegistry
@@ -423,6 +424,99 @@ class NTFS(Module):
                 fs,
                 name,
             )
+
+
+@register_module("--collect-filesystem-metadata")
+@module_arg(
+    "--filesystem-metadata-thin",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help=(
+        "skip inode table regions that were never used, at the cost of losing deleted inodes "
+        "(defaults to on for the default profile, off for the full profile)"
+    ),
+)
+class FilesystemMetadata(Module):
+    DESC = "filesystem metadata of all filesystems"
+    EXEC_ORDER = ExecutionOrder.TOP
+
+    # A snapshot that holds nothing but filesystem metadata cannot be opened at all: the contents of
+    # files that were not collected read back as sparse filler, and the OS plugins decode that filler
+    # as text while identifying the target, which fails hard. Collecting the handful of files they
+    # look at keeps the snapshot usable on its own, whichever other modules were selected.
+    SPEC = (
+        ("path", "/etc/hostname"),
+        ("path", "/etc/HOSTNAME"),
+        ("path", "/etc/hosts"),
+        # The Unix plugin globs for release files and reads every match, so naming the ones we know
+        # about is not enough - a single uncollected /etc/lsb-release is one sparse read away from
+        # taking the whole target down with it
+        ("glob", "/etc/*-release"),
+        ("glob", "/etc/*_version"),
+        ("path", "/usr/lib/os-release"),
+        ("path", "/etc/fstab"),
+        ("path", "/System/Library/CoreServices/SystemVersion.plist"),
+        ("path", "sysvol/windows/system32/config/system"),
+        ("path", "sysvol/windows/system32/config/software"),
+    )
+
+    # The full profile is meant to leave nothing behind, so it keeps the unused inode table regions
+    # and with them the deleted inodes. The default profile trades those away to stay compact.
+    THIN_BY_PROFILE: ClassVar[dict[str, bool]] = {"full": False}
+    THIN_DEFAULT = True
+
+    @classmethod
+    def _run(cls, target: Target, cli_args: argparse.Namespace, collector: Collector) -> None:
+        output = collector.output
+
+        if not isinstance(output, AsdfOutput):
+            log.warning(
+                "Skipping filesystem metadata collection: it needs the asdf output format, "
+                "which can store metadata sparsely at its original disk offsets. Use --output-type asdf."
+            )
+            return
+
+        thin = cls._thin(cli_args)
+        log.info("Collecting %s filesystem metadata", "thin" if thin else "full")
+
+        seen = set()
+        total = 0
+
+        for fs in target.filesystems:
+            # One on-disk filesystem can surface as several Filesystem objects, most notably one per
+            # Btrfs subvolume, and they all describe the same structures
+            key = fsmeta.identity(fs)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if not fsmeta.supported(fs):
+                continue
+
+            log.info("Acquiring filesystem metadata from %s", fs)
+
+            runs = fsmeta.enumerate_runs(fs, thin=thin)
+            if runs is None:
+                continue
+
+            written = output.write_filesystem_metadata(fs, runs)
+            total += written
+            log.info("Collected %.2f MiB of filesystem metadata from %s", written / 1024 / 1024, fs)
+
+        log.info("Collected %.2f MiB of filesystem metadata in total", total / 1024 / 1024)
+
+    @classmethod
+    def _thin(cls, cli_args: argparse.Namespace) -> bool:
+        """Decide whether to thin the inode tables.
+
+        An explicit ``--filesystem-metadata-thin`` or ``--no-filesystem-metadata-thin`` always wins.
+        Without one, the collection profile decides.
+        """
+        explicit = getattr(cli_args, "filesystem_metadata_thin", None)
+        if explicit is not None:
+            return explicit
+
+        return cls.THIN_BY_PROFILE.get(getattr(cli_args, "profile", None), cls.THIN_DEFAULT)
 
 
 @register_module("-r", "--registry")
@@ -2182,6 +2276,7 @@ class WindowsProfile:
         ActivitiesCache,
         CamHistory,
         DPAPI,
+        FilesystemMetadata,
     )
     FULL = (
         *DEFAULT,
@@ -2206,7 +2301,10 @@ class LinuxProfile:
         SSH,
         Var,
     )
-    DEFAULT = MINIMAL
+    DEFAULT = (
+        *MINIMAL,
+        FilesystemMetadata,
+    )
     FULL = (
         *DEFAULT,
         Applications,
@@ -2227,8 +2325,11 @@ class BsdProfile:
         Var,
         BSD,
     )
-    DEFAULT = MINIMAL
-    FULL = MINIMAL
+    DEFAULT = (
+        *MINIMAL,
+        FilesystemMetadata,
+    )
+    FULL = DEFAULT
 
 
 class ESXiProfile:
@@ -2240,6 +2341,7 @@ class ESXiProfile:
     DEFAULT = (
         *MINIMAL,
         VMFS,
+        FilesystemMetadata,
     )
     FULL = DEFAULT
 
@@ -2252,7 +2354,10 @@ class MacOSProfile:
         MacOS,
         MacOSApplicationsInfo,
     )
-    DEFAULT = MINIMAL
+    DEFAULT = (
+        *MINIMAL,
+        FilesystemMetadata,
+    )
     FULL = (
         *DEFAULT,
         History,
@@ -2269,7 +2374,9 @@ class ProxmoxProfile:
         SSH,
         Var,
     )
-    DEFAULT = MINIMAL
+    DEFAULT = (
+        *MINIMAL,
+    )
     FULL = (
         *DEFAULT,
         History,

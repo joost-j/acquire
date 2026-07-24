@@ -18,6 +18,7 @@ from dissect.target.helpers import keychain
 from dissect.target.tools.utils.cli import _OverrideRequiredAction, list_children
 
 from acquire.outputs import (
+    ASDF_COMPRESSION_METHODS,
     COMPRESSION_METHODS,
     OUTPUTS,
     TAR_COMPRESSION_METHODS,
@@ -362,6 +363,13 @@ def check_and_set_acquire_args(
             raise ValueError(
                 f"Invalid compression method for zip, allowed are: {', '.join(ZIP_COMPRESSION_METHODS.keys())}"
             )
+        if (
+            args.output_type == "asdf" and args.compress_method
+        ) and args.compress_method not in ASDF_COMPRESSION_METHODS:
+            raise ValueError(
+                f"Invalid compression method for asdf, allowed are: {', '.join(ASDF_COMPRESSION_METHODS.keys())}"
+            )
+
         if (args.output_type == "tar" and args.compress_method) and args.compress_method not in TAR_COMPRESSION_METHODS:
             raise ValueError(
                 f"Invalid compression method for tar, allowed are: {', '.join(TAR_COMPRESSION_METHODS.keys())}"
